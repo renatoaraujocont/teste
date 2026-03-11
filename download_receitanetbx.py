@@ -5,11 +5,8 @@ Diagnóstico Receitanet BX — foco em erro 5002.
 
 Objetivo:
 - Executar testes reproduzíveis contra o servidor para descobrir qual combinação
-  semântica de payload (idSistema/idPapel/campos) evita o erro 5002.
-- Gerar trilha de auditoria (JSONL/CSV) com request/response por tentativa.
-
-Este script NÃO tenta automatizar todo o fluxo de download. Ele é um utilitário
-para investigação precisa de erro de negócio.
+  semântica/protocolo evita o erro 5002.
+- Gerar trilha de auditoria (JSONL/CSV) com telemetria por tentativa.
 """
 
 from __future__ import annotations
@@ -18,7 +15,6 @@ import argparse
 import csv
 import itertools
 import json
-import logging
 import re
 import socket
 import ssl
@@ -27,7 +23,7 @@ import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
 # Dependência opcional para extrair cert/key de PFX (mTLS).
 try:
@@ -52,9 +48,17 @@ class ProbeResult:
     campo_inicio: str
     data_inicio: str
     data_fim: str
+    transport_mode: str
+    length_endian: str
+    version: int
+    reserved: int
+    sni: str
+    greeting_hex: str
     status: str
     codigo_detectado: str
     mensagem_detectada: str
+    rtt_ms: int
+    bytes_recebidos: int
     resposta_preview: str
 
 
@@ -68,13 +72,16 @@ class FrameCodec:
         reserved: int = 0x00,
         payload_encoding: str = "iso-8859-1",
         length_endian: str = "little",
+        zlib_level: int = 6,
+        append_newline: bool = False,
     ) -> bytes:
         raw = text.encode(payload_encoding)
-        comp = zlib.compress(raw)
-        header = bytes(
-            [version]
-        ) + len(raw).to_bytes(2, byteorder=length_endian, signed=False) + bytes([reserved])
-        return header + comp
+        comp = zlib.compress(raw, level=zlib_level)
+        header = bytes([version]) + len(raw).to_bytes(2, byteorder=length_endian, signed=False) + bytes([reserved])
+        packet = header + comp
+        if append_newline:
+            packet += b"\n"
+        return packet
 
     @staticmethod
     def decode(
@@ -105,9 +112,7 @@ class MTLSContextFactory:
             raise RuntimeError("cryptography não disponível. Instale: pip install cryptography")
 
         data = Path(pfx_path).read_bytes()
-        key, cert, _ = pkcs12.load_key_and_certificates(
-            data, password.encode("utf-8") if password else None
-        )
+        key, cert, _ = pkcs12.load_key_and_certificates(data, password.encode("utf-8") if password else None)
         if key is None or cert is None:
             raise RuntimeError("PFX inválido ou sem chave/certificado.")
 
@@ -132,26 +137,61 @@ class MTLSContextFactory:
 
 
 class ReceitanetProbeClient:
+    """Cliente com modos de transporte para reduzir casos 'sem_resposta'."""
+
     def __init__(self, host: str, port: int, timeout: int, ssl_ctx: ssl.SSLContext):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.ssl_ctx = ssl_ctx
 
-    def round_trip(self, packet: bytes) -> bytes:
+    def round_trip(
+        self,
+        packet: bytes,
+        transport_mode: str,
+        sni: str,
+        greeting: bytes,
+    ) -> Tuple[bytes, int]:
+        start = time.monotonic()
+        if transport_mode == "plain":
+            raw = self._round_trip_plain(packet, greeting)
+        elif transport_mode == "tls":
+            raw = self._round_trip_tls(packet, sni, greeting)
+        elif transport_mode == "tls-no-sni":
+            raw = self._round_trip_tls(packet, "", greeting)
+        else:
+            raise ValueError(f"transport_mode inválido: {transport_mode}")
+        rtt_ms = int((time.monotonic() - start) * 1000)
+        return raw, rtt_ms
+
+    def _round_trip_plain(self, packet: bytes, greeting: bytes) -> bytes:
         with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
-            with self.ssl_ctx.wrap_socket(sock, server_hostname=self.host) as ssock:
+            sock.settimeout(self.timeout)
+            if greeting:
+                sock.sendall(greeting)
+            sock.sendall(packet)
+            return self._recv_all(sock)
+
+    def _round_trip_tls(self, packet: bytes, sni: str, greeting: bytes) -> bytes:
+        with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
+            sock.settimeout(self.timeout)
+            sni_name = sni if sni else None
+            with self.ssl_ctx.wrap_socket(sock, server_hostname=sni_name) as ssock:
+                if greeting:
+                    ssock.sendall(greeting)
                 ssock.sendall(packet)
-                chunks: List[bytes] = []
-                ssock.settimeout(self.timeout)
-                while True:
-                    try:
-                        chunk = ssock.recv(8192)
-                    except socket.timeout:
-                        break
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+                return self._recv_all(ssock)
+
+    def _recv_all(self, conn: socket.socket) -> bytes:
+        chunks: List[bytes] = []
+        while True:
+            try:
+                chunk = conn.recv(8192)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
         return b"".join(chunks)
 
 
@@ -192,6 +232,52 @@ def detect_business_error(text: str) -> Tuple[str, str]:
     return "", msg[:240]
 
 
+def parse_csv_list(raw: str) -> List[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def parse_int_list(raw: str) -> List[int]:
+    values: List[int] = []
+    for token in parse_csv_list(raw):
+        token = token.strip().lower()
+        values.append(int(token, 16) if token.startswith("0x") else int(token))
+    return values
+
+
+def parse_greeting(raw: str) -> bytes:
+    """
+    Aceita:
+      - vazio -> b''
+      - hex:001122AABB
+      - text:HELLO\r\n
+    """
+    raw = raw.strip()
+    if not raw:
+        return b""
+    if raw.startswith("hex:"):
+        return bytes.fromhex(raw[4:])
+    if raw.startswith("text:"):
+        return raw[5:].encode("latin-1", errors="replace")
+    return bytes.fromhex(raw)
+
+
+def decode_response_best_effort(packet: bytes) -> Tuple[str, str, str]:
+    """Retorna status_decode, texto_decodificado, preview."""
+    if not packet:
+        return "sem_resposta", "", ""
+
+    decode_errors: List[str] = []
+    for endian in ("little", "big"):
+        for encoding in ("iso-8859-1", "utf-8"):
+            try:
+                _, text = FrameCodec.decode(packet, payload_encoding=encoding, length_endian=endian)
+                return "ok", text, text[:240].replace("\n", " ")
+            except Exception as err:
+                decode_errors.append(f"{endian}/{encoding}:{type(err).__name__}")
+
+    return "decode_error", "", packet[:120].hex() + " | " + ",".join(decode_errors[:3])
+
+
 def run_semantic_matrix(
     client: ReceitanetProbeClient,
     out_jsonl: Path,
@@ -202,6 +288,13 @@ def run_semantic_matrix(
     data_inicio: str,
     data_fim: str,
     pause_ms: int,
+    transport_modes: Iterable[str],
+    length_endians: Iterable[str],
+    versions: Iterable[int],
+    reserved_values: Iterable[int],
+    sni_values: Iterable[str],
+    greeting: bytes,
+    append_newline: bool,
 ) -> List[ProbeResult]:
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -210,7 +303,18 @@ def run_semantic_matrix(
     idx = 0
 
     with out_jsonl.open("w", encoding="utf-8") as jfp:
-        for id_sistema, id_papel, campo_inicio in itertools.product(id_sistemas, id_papeis, campos_inicio):
+        product_iter = itertools.product(
+            id_sistemas,
+            id_papeis,
+            campos_inicio,
+            transport_modes,
+            length_endians,
+            versions,
+            reserved_values,
+            sni_values,
+        )
+
+        for id_sistema, id_papel, campo_inicio, transport_mode, length_endian, version, reserved, sni in product_iter:
             idx += 1
             payload = build_properties_payload(
                 id_sistema=id_sistema,
@@ -219,28 +323,39 @@ def run_semantic_matrix(
                 data_inicio=data_inicio,
                 data_fim=data_fim,
             )
-            packet = FrameCodec.encode(payload)
+            packet = FrameCodec.encode(
+                payload,
+                version=version,
+                reserved=reserved,
+                length_endian=length_endian,
+                append_newline=append_newline,
+            )
 
             status = "ok"
             detected_code = ""
             detected_msg = ""
             preview = ""
+            rtt_ms = 0
+            bytes_recv = 0
 
             try:
-                response_packet = client.round_trip(packet)
-                if not response_packet:
-                    status = "sem_resposta"
-                else:
-                    try:
-                        _, response_text = FrameCodec.decode(response_packet)
-                        detected_code, detected_msg = detect_business_error(response_text)
-                        preview = response_text[:240].replace("\n", " ")
-                    except Exception as dec_err:
-                        status = f"decode_error:{type(dec_err).__name__}"
-                        preview = response_packet[:120].hex()
-            except Exception as net_err:
-                status = f"network_error:{type(net_err).__name__}"
-                preview = str(net_err)[:240]
+                response_packet, rtt_ms = client.round_trip(
+                    packet=packet,
+                    transport_mode=transport_mode,
+                    sni=sni,
+                    greeting=greeting,
+                )
+                bytes_recv = len(response_packet)
+                decode_status, response_text, preview = decode_response_best_effort(response_packet)
+                status = decode_status
+                if decode_status == "ok":
+                    detected_code, detected_msg = detect_business_error(response_text)
+            except ssl.SSLError as err:
+                status = f"ssl_error:{err.__class__.__name__}"
+                preview = str(err)[:240]
+            except Exception as err:
+                status = f"network_error:{err.__class__.__name__}"
+                preview = str(err)[:240]
 
             pr = ProbeResult(
                 idx=idx,
@@ -249,32 +364,22 @@ def run_semantic_matrix(
                 campo_inicio=campo_inicio,
                 data_inicio=data_inicio,
                 data_fim=data_fim,
+                transport_mode=transport_mode,
+                length_endian=length_endian,
+                version=version,
+                reserved=reserved,
+                sni=sni,
+                greeting_hex=greeting.hex(),
                 status=status,
                 codigo_detectado=detected_code,
                 mensagem_detectada=detected_msg,
+                rtt_ms=rtt_ms,
+                bytes_recebidos=bytes_recv,
                 resposta_preview=preview,
             )
             results.append(pr)
 
-            jfp.write(
-                json.dumps(
-                    {
-                        "idx": pr.idx,
-                        "idSistema": pr.id_sistema,
-                        "idPapel": pr.id_papel,
-                        "campoInicio": pr.campo_inicio,
-                        "dataInicio": pr.data_inicio,
-                        "dataFim": pr.data_fim,
-                        "status": pr.status,
-                        "codigoDetectado": pr.codigo_detectado,
-                        "mensagemDetectada": pr.mensagem_detectada,
-                        "respostaPreview": pr.resposta_preview,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-
+            jfp.write(json.dumps(pr.__dict__, ensure_ascii=False) + "\n")
             time.sleep(max(0, pause_ms) / 1000)
 
     with out_csv.open("w", newline="", encoding="utf-8") as cfp:
@@ -287,9 +392,17 @@ def run_semantic_matrix(
                 "campoInicio",
                 "dataInicio",
                 "dataFim",
+                "transportMode",
+                "lengthEndian",
+                "version",
+                "reserved",
+                "sni",
+                "greetingHex",
                 "status",
                 "codigoDetectado",
                 "mensagemDetectada",
+                "rttMs",
+                "bytesRecebidos",
                 "respostaPreview",
             ]
         )
@@ -302,9 +415,17 @@ def run_semantic_matrix(
                     r.campo_inicio,
                     r.data_inicio,
                     r.data_fim,
+                    r.transport_mode,
+                    r.length_endian,
+                    r.version,
+                    r.reserved,
+                    r.sni,
+                    r.greeting_hex,
                     r.status,
                     r.codigo_detectado,
                     r.mensagem_detectada,
+                    r.rtt_ms,
+                    r.bytes_recebidos,
                     r.resposta_preview,
                 ]
             )
@@ -314,19 +435,24 @@ def run_semantic_matrix(
 
 def run_self_test() -> None:
     payload = "id=periodoEntrega\ndataInicio=01/01/2025\ndataFim=31/01/2025"
-    packet = FrameCodec.encode(payload)
-    header, decoded = FrameCodec.decode(packet)
 
-    assert decoded == payload, "Decode diferente do payload original"
-    assert header["actual_len"] == len(payload.encode("iso-8859-1")), "Tamanho real inválido"
+    for endian in ("little", "big"):
+        packet = FrameCodec.encode(payload, length_endian=endian, version=0x02, reserved=0x00)
+        header, decoded = FrameCodec.decode(packet, length_endian=endian)
+        assert decoded == payload, f"Decode diferente do payload ({endian})"
+        assert header["actual_len"] == len(payload.encode("iso-8859-1")), "Tamanho real inválido"
 
     code, msg = detect_business_error("5002 - Erro no processamento da solicitação")
     assert code == "5002", "Não detectou código 5002"
     assert "5002" in msg, "Mensagem detectada sem código"
 
+    assert parse_greeting("") == b""
+    assert parse_greeting("hex:4142") == b"AB"
+    assert parse_greeting("text:AB") == b"AB"
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Diagnóstico semântico do Receitanet BX (erro 5002)")
+    p = argparse.ArgumentParser(description="Diagnóstico semântico/protocolo do Receitanet BX (erro 5002)")
     p.add_argument("--host", default=HOST_DEFAULT)
     p.add_argument("--port", type=int, default=PORT_DEFAULT)
     p.add_argument("--timeout", type=int, default=20)
@@ -338,23 +464,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--id-papeis", default="1,2", help="Lista CSV de idPapel")
     p.add_argument("--campos-inicio", default="dataInicio,dataIniion", help="Lista CSV de nomes de campo")
 
+    p.add_argument("--transport-modes", default="tls,tls-no-sni,plain", help="CSV: tls,tls-no-sni,plain")
+    p.add_argument("--length-endians", default="little,big", help="CSV: little,big")
+    p.add_argument("--versions", default="1,2", help="CSV de versões do byte 0 do header")
+    p.add_argument("--reserved-values", default="0", help="CSV de valores do byte reservado")
+    p.add_argument("--sni-values", default=f"{HOST_DEFAULT},", help="CSV de SNI; vazio permitido")
+    p.add_argument("--greeting", default="", help="prefixo opcional: hex:... ou text:...")
+    p.add_argument("--append-newline", action="store_true", help="Adiciona \\n ao fim do pacote")
+
     p.add_argument("--data-inicio", default="01/01/2025")
     p.add_argument("--data-fim", default="31/01/2025")
-    p.add_argument("--pause-ms", type=int, default=400)
+    p.add_argument("--pause-ms", type=int, default=300)
 
     p.add_argument("--out-jsonl", default="diagnostico_receitanet/resultados.jsonl")
     p.add_argument("--out-csv", default="diagnostico_receitanet/resultados.csv")
     p.add_argument("--self-test", action="store_true", help="Executa testes locais sem rede")
-    p.add_argument("--debug", action="store_true")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
 
     if args.self_test:
         run_self_test()
@@ -367,9 +496,15 @@ def main() -> int:
     ssl_ctx = MTLSContextFactory.from_pfx(args.pfx, args.senha)
     client = ReceitanetProbeClient(args.host, args.port, args.timeout, ssl_ctx)
 
-    id_sistemas = [x.strip() for x in args.id_sistemas.split(",") if x.strip()]
-    id_papeis = [x.strip() for x in args.id_papeis.split(",") if x.strip()]
-    campos_inicio = [x.strip() for x in args.campos_inicio.split(",") if x.strip()]
+    id_sistemas = parse_csv_list(args.id_sistemas)
+    id_papeis = parse_csv_list(args.id_papeis)
+    campos_inicio = parse_csv_list(args.campos_inicio)
+    transport_modes = parse_csv_list(args.transport_modes)
+    length_endians = parse_csv_list(args.length_endians)
+    versions = parse_int_list(args.versions)
+    reserved_values = parse_int_list(args.reserved_values)
+    sni_values = [s for s in args.sni_values.split(",")]
+    greeting = parse_greeting(args.greeting)
 
     results = run_semantic_matrix(
         client=client,
@@ -381,22 +516,32 @@ def main() -> int:
         data_inicio=args.data_inicio,
         data_fim=args.data_fim,
         pause_ms=args.pause_ms,
+        transport_modes=transport_modes,
+        length_endians=length_endians,
+        versions=versions,
+        reserved_values=reserved_values,
+        sni_values=sni_values,
+        greeting=greeting,
+        append_newline=args.append_newline,
     )
 
     total = len(results)
+    sem_resposta = sum(1 for r in results if r.status == "sem_resposta")
     err5002 = sum(1 for r in results if r.codigo_detectado == "5002")
-    sucesso_sem_5002 = [r for r in results if r.status == "ok" and r.codigo_detectado != "5002"]
+    candidatas = [r for r in results if r.status == "ok" and r.codigo_detectado != "5002"]
 
     print(f"Tentativas: {total}")
+    print(f"Sem resposta: {sem_resposta}")
     print(f"Com código 5002: {err5002}")
-    print(f"Candidatas sem 5002: {len(sucesso_sem_5002)}")
+    print(f"Candidatas sem 5002: {len(candidatas)}")
 
-    if sucesso_sem_5002:
-        print("\nTop 5 candidatas:")
-        for r in sucesso_sem_5002[:5]:
+    if candidatas:
+        print("\nTop 10 candidatas:")
+        for r in candidatas[:10]:
             print(
-                f"  idx={r.idx} idSistema={r.id_sistema} idPapel={r.id_papel} "
-                f"campoInicio={r.campo_inicio} status={r.status} codigo={r.codigo_detectado or '-'}"
+                f"idx={r.idx} idSistema={r.id_sistema} idPapel={r.id_papel} "
+                f"modo={r.transport_mode} endian={r.length_endian} v={r.version} "
+                f"status={r.status} codigo={r.codigo_detectado or '-'} bytes={r.bytes_recebidos} rtt={r.rtt_ms}ms"
             )
 
     return 0
